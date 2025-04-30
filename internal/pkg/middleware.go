@@ -86,7 +86,7 @@ func TeamAuthMiddleware(secret string) gin.HandlerFunc {
 	return func(c *gin.Context) {
 		authHeader := c.GetHeader("Authorization")
 		if authHeader == "" {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Authorization header required"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Требуется авторизация"})
 			return
 		}
 
@@ -96,19 +96,19 @@ func TeamAuthMiddleware(secret string) gin.HandlerFunc {
 		})
 
 		if err != nil || !token.Valid {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid token"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Неверный токен"})
 			return
 		}
 
 		claims, ok := token.Claims.(jwt.MapClaims)
 		if !ok || claims["role"] != "team" {
-			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Access denied"})
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Доступ запрещен"})
 			return
 		}
 
 		teamID, err := uuid.Parse(claims["sub"].(string))
 		if err != nil {
-			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Invalid team ID"})
+			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "Неверный ID команды"})
 			return
 		}
 

@@ -4,6 +4,7 @@ import (
 	"Cyber-chase/internal/models"
 	"Cyber-chase/internal/pkg"
 	"Cyber-chase/internal/repository"
+	"Cyber-chase/internal/service"
 	"crypto/rand"
 	"fmt"
 	"github.com/gin-gonic/gin"
@@ -18,16 +19,18 @@ import (
 )
 
 type CompanyHandler struct {
-	repo      *repository.Repository
-	mailer    MailService
-	jwtSecret string
+	repo        *repository.Repository
+	mailer      MailService
+	jwtSecret   string
+	teamService service.TeamService
 }
 
-func NewCompanyHandler(repo *repository.Repository, mailer MailService) *CompanyHandler {
+func NewCompanyHandler(repo *repository.Repository, mailer MailService, teamService service.TeamService) *CompanyHandler {
 	return &CompanyHandler{
-		repo:      repo,
-		mailer:    mailer,
-		jwtSecret: os.Getenv("JWT_SECRET"),
+		repo:        repo,
+		mailer:      mailer,
+		jwtSecret:   os.Getenv("JWT_SECRET"),
+		teamService: teamService,
 	}
 }
 
@@ -537,48 +540,6 @@ func (h *CompanyTaskHandler) UpdateTask(c *gin.Context) {
 	c.JSON(http.StatusOK, gin.H{"status": "updated", "task": task})
 }
 
-func (h *CompanyHandler) ApproveTeam(c *gin.Context) {
-	companyID, err := uuid.Parse(c.GetString("companyID"))
-	if err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid company ID"})
-		return
-	}
-
-	var input struct {
-		TeamID uuid.UUID `json:"team_id" binding:"required"`
-	}
-
-	if err := c.ShouldBindJSON(&input); err != nil {
-		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-		return
-	}
-
-	company, err := h.repo.GetCompanyByID(c.Request.Context(), companyID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Company not found"})
-		return
-	}
-
-	if company.CurrentTeamID != nil {
-		c.JSON(http.StatusConflict, gin.H{"error": "Company is occupied"})
-		return
-	}
-
-	team, err := h.repo.GetTeamByID(c.Request.Context(), input.TeamID)
-	if err != nil {
-		c.JSON(http.StatusNotFound, gin.H{"error": "Team not found"})
-		return
-	}
-
-	company.CurrentTeamID = &team.ID
-	if err := h.repo.UpdateCompany(c.Request.Context(), company); err != nil {
-		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to approve team"})
-		return
-	}
-
-	c.JSON(http.StatusOK, gin.H{"status": "approved"})
-}
-
 func (h *CompanyTaskHandler) DeleteTask(c *gin.Context) {
 	taskID, err := uuid.Parse(c.Param("id"))
 	if err != nil {
@@ -642,4 +603,34 @@ func (h *CompanyTaskHandler) GetTaskFile(c *gin.Context) {
 
 	// Serve the file
 	c.FileAttachment(filePath, task.QuestionFile)
+}
+
+func (h *CompanyHandler) GetUnassignedTeams(c *gin.Context) {
+	teams, err := h.teamService.GetUnassignedTeams()
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, teams)
+}
+
+func (h *CompanyHandler) ApproveTeam(c *gin.Context) {
+	companyID, err := uuid.Parse(c.GetString("companyID"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid company ID"})
+		return
+	}
+
+	teamID, err := uuid.Parse(c.Param("teamID"))
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid team ID"})
+		return
+	}
+
+	if err := h.teamService.ApproveTeam(teamID, companyID); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "team approved"})
 }

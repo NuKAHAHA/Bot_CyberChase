@@ -4,7 +4,6 @@ import (
 	"Cyber-chase/internal/models"
 	"context"
 	"errors"
-
 	"github.com/google/uuid"
 	"gorm.io/gorm"
 )
@@ -108,57 +107,6 @@ func (r *Repository) UpdateTaskWithFile(ctx context.Context, task *models.Task) 
 	return r.db.WithContext(ctx).Save(task).Error
 }
 
-func (r *Repository) CreateTeam(ctx context.Context, team *models.Team) error {
-	return r.db.WithContext(ctx).Create(team).Error
-}
-
-func (r *Repository) GetTeamByID(ctx context.Context, id uuid.UUID) (*models.Team, error) {
-	var team models.Team
-	err := r.db.WithContext(ctx).First(&team, "id = ?", id).Error
-	return &team, err
-}
-
-func (r *Repository) UpdateTeam(ctx context.Context, team *models.Team) error {
-	return r.db.WithContext(ctx).Save(team).Error
-}
-
-func (r *Repository) GetAllTeams(ctx context.Context) ([]models.Team, error) {
-	var teams []models.Team
-	err := r.db.WithContext(ctx).Find(&teams).Error
-	return teams, err
-}
-
-func (r *Repository) CreateTeamTask(ctx context.Context, teamTask *models.TeamTask) error {
-	return r.db.WithContext(ctx).Create(teamTask).Error
-}
-
-func (r *Repository) GetTeamTasks(ctx context.Context, teamID uuid.UUID) ([]models.TeamTask, error) {
-	var tasks []models.TeamTask
-	err := r.db.WithContext(ctx).Where("team_id = ?", teamID).Find(&tasks).Error
-	return tasks, err
-}
-
-func (r *Repository) GetAllTeamsWithActiveTasks(ctx context.Context) ([]models.Team, error) {
-	var teams []models.Team
-	err := r.db.WithContext(ctx).Where("current_task_id IS NOT NULL").Find(&teams).Error
-	return teams, err
-}
-
-func (r *Repository) GetTeamByContactInfo(ctx context.Context, contactID string) (*models.Team, error) {
-	var team models.Team
-	err := r.db.WithContext(ctx).Where("contact_info = ?", contactID).First(&team).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) {
-		return nil, ErrNotFound
-	}
-	return &team, err
-}
-
-func (r *Repository) WithTransaction(ctx context.Context, fn func(context.Context) error) error {
-	return r.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-		return fn(ctx)
-	})
-}
-
 // In repository/repository.go
 func (r *Repository) GetNextAvailableCompany(ctx context.Context, contestID uuid.UUID) (*models.Company, error) {
 	// Instead of directly querying by contest_id, we need to join with tasks
@@ -191,4 +139,23 @@ func (r *Repository) GetTaskByCompanyID(ctx context.Context, companyID uuid.UUID
 		return nil, err
 	}
 	return &task, nil
+}
+
+func (r *Repository) GetUnassignedTeams(ctx context.Context) ([]models.Team, error) {
+	var teams []models.Team
+	err := r.db.WithContext(ctx).
+		Where("company_id IS NULL AND is_approved = false").
+		Find(&teams).
+		Error
+	return teams, err
+}
+
+func (r *Repository) ApproveTeam(ctx context.Context, teamID, companyID uuid.UUID) error {
+	return r.db.WithContext(ctx).
+		Model(&models.Team{}).
+		Where("id = ?", teamID).
+		Updates(map[string]interface{}{
+			"company_id":  companyID,
+			"is_approved": true,
+		}).Error
 }

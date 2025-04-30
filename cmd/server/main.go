@@ -6,11 +6,16 @@ import (
 	"Cyber-chase/internal/models"
 	"Cyber-chase/internal/pkg"
 	"Cyber-chase/internal/repository"
+	"Cyber-chase/internal/service"
+	"Cyber-chase/internal/team"
+	"github.com/gin-contrib/cors"
 	"github.com/gin-gonic/gin"
 	"github.com/joho/godotenv"
 	"gorm.io/driver/postgres"
 	"gorm.io/gorm"
+	"log"
 	"os"
+	"time"
 )
 
 func main() {
@@ -24,8 +29,7 @@ func main() {
 		panic("Error loading .env file")
 	}
 
-	db.AutoMigrate(&models.Contest{}, &models.Company{}, &models.Task{}, &models.Team{},
-		&models.TeamTask{})
+	db.AutoMigrate(&models.Contest{}, &models.Company{}, &models.Task{}, &models.Team{})
 
 	repo := repository.NewRepository(db)
 	adminHandler := admin.NewAdminHandler(repo, "admin", "0000")
@@ -37,30 +41,48 @@ func main() {
 		os.Getenv("SMTP_PASS"),
 	)
 
-	companyHandler := company.NewCompanyHandler(repo, mailService)
 	companyTaskHandler := company.NewCompanyTaskHandler(repo)
-
+	teamRepo := repository.NewTeamRepository(db)
+	teamService := service.NewTeamService(teamRepo, mailService)
+	companyHandler := company.NewCompanyHandler(repo, mailService, teamService)
+	teamHandler := team.NewTeamHandler(teamService)
 	jwtSecret := os.Getenv("JWT_SECRET")
 
 	router := gin.Default()
 
-	/*bot, err := tele.NewBot(tele.Settings{
-		Token: os.Getenv("BOT_TOKEN"),
-	})
-	if err != nil {
-		panic("failed to create bot")
+	router.Use(cors.New(cors.Config{
+		AllowOrigins:     []string{"http://localhost:4200"},
+		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
+		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
+		ExposeHeaders:    []string{"Content-Length"},
+		AllowCredentials: true,
+		MaxAge:           12 * time.Hour,
+	}))
+
+	botToken := os.Getenv("BOT_TOKEN")
+	if botToken == "" {
+		log.Fatal("BOT_TOKEN environment variable not set")
 	}
 
-	teamHandler := team.NewTeamHandler(repo, bot)
+	bot, err := team.NewTelegramBot(botToken, teamService)
+	if err != nil {
+		log.Fatalf("Failed to create telegram bot: %v", err)
+	}
 
-	go teamHandler.StartBot()
-	*/
+	log.Println("Bot is now running. Press Ctrl+C to exit.")
+	go func() {
+		log.Println("Bot is starting...")
+		if err := bot.Start(); err != nil {
+			log.Printf("Bot stopped with error: %v", err)
+		}
+	}()
+
 	public := router.Group("/api/v1")
 	{
 		public.POST("/admin/login", adminHandler.AdminLogin)
 		public.POST("/company/login", companyHandler.CompanyLogin)
-		//public.POST("/team/register", teamHandler.RegisterTeam)
-		//public.POST("/team/login", teamHandler.LoginTeam)
+		public.POST("/team/register", teamHandler.RegisterTeam)
+		public.POST("/team/login", teamHandler.LoginTeam)
 	}
 
 	adminRoutes := router.Group("/api/v1/admin")
@@ -88,23 +110,15 @@ func main() {
 
 		companyRoutes.GET("/location", companyHandler.GetMapLink)
 
-		companyRoutes.POST("/approve-team", companyHandler.ApproveTeam)
-
 		companyRoutes.POST("/tasks", companyTaskHandler.CreateTask)
 		companyRoutes.GET("/tasks", companyTaskHandler.GetCompanyTasks)
 		companyRoutes.GET("/tasks/:id/file", companyTaskHandler.GetTaskFile)
 		companyRoutes.PUT("/tasks/:id", companyTaskHandler.UpdateTask)
 		companyRoutes.DELETE("/tasks/:id", companyTaskHandler.DeleteTask)
+
+		companyRoutes.GET("/teams", companyHandler.GetUnassignedTeams)
+		companyRoutes.POST("/teams/:teamID/approve", companyHandler.ApproveTeam)
 	}
-	/*
-		teamRoutes := router.Group("/api/v1/team")
-		teamRoutes.Use(pkg.TeamAuthMiddleware(jwtSecret))
-		{
-			teamRoutes.GET("/task", teamHandler.GetCurrentTask)
-			teamRoutes.POST("/task/submit", teamHandler.SubmitAnswer)
-			teamRoutes.GET("/next-location", teamHandler.GetNextLocation)
-			teamRoutes.GET("/leaderboard", teamHandler.GetLeaderboard)
-		}
-	*/
+
 	router.Run(":8080")
 }
