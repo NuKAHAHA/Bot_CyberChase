@@ -82,13 +82,6 @@ func (r *Repository) GetTaskByID(ctx context.Context, id uuid.UUID) (*models.Tas
 	return &task, err
 }
 
-func (r *Repository) ApproveTask(ctx context.Context, taskID uuid.UUID) error {
-	return r.db.WithContext(ctx).
-		Model(&models.Task{}).
-		Where("id = ?", taskID).
-		Update("is_approved", true).Error
-}
-
 func (r *Repository) DeleteTask(ctx context.Context, taskID uuid.UUID) error {
 	return r.db.WithContext(ctx).Delete(&models.Task{}, "id = ?", taskID).Error
 }
@@ -101,61 +94,4 @@ func (r *Repository) GetTasksByCompanyID(ctx context.Context, companyID uuid.UUI
 
 func (r *Repository) UpdateTask(ctx context.Context, task *models.Task) error {
 	return r.db.WithContext(ctx).Save(task).Error
-}
-
-func (r *Repository) UpdateTaskWithFile(ctx context.Context, task *models.Task) error {
-	return r.db.WithContext(ctx).Save(task).Error
-}
-
-// In repository/repository.go
-func (r *Repository) GetNextAvailableCompany(ctx context.Context, contestID uuid.UUID) (*models.Company, error) {
-	// Instead of directly querying by contest_id, we need to join with tasks
-	var company models.Company
-
-	// First approach: Get companies that have tasks for this contest and no current team
-	result := r.db.Table("companies").
-		Joins("JOIN tasks ON tasks.company_id = companies.id").
-		Where("tasks.contest_id = ? AND companies.current_team_id IS NULL", contestID).
-		Order("companies.id").
-		First(&company)
-
-	if result.Error != nil {
-		if errors.Is(result.Error, gorm.ErrRecordNotFound) {
-			return nil, ErrNotFound
-		}
-		return nil, result.Error
-	}
-
-	return &company, nil
-}
-
-func (r *Repository) GetTaskByCompanyID(ctx context.Context, companyID uuid.UUID) (*models.Task, error) {
-	var task models.Task
-	err := r.db.WithContext(ctx).
-		Where("company_id = ?", companyID).
-		First(&task).
-		Error
-	if err != nil {
-		return nil, err
-	}
-	return &task, nil
-}
-
-func (r *Repository) GetUnassignedTeams(ctx context.Context) ([]models.Team, error) {
-	var teams []models.Team
-	err := r.db.WithContext(ctx).
-		Where("company_id IS NULL AND is_approved = false").
-		Find(&teams).
-		Error
-	return teams, err
-}
-
-func (r *Repository) ApproveTeam(ctx context.Context, teamID, companyID uuid.UUID) error {
-	return r.db.WithContext(ctx).
-		Model(&models.Team{}).
-		Where("id = ?", teamID).
-		Updates(map[string]interface{}{
-			"company_id":  companyID,
-			"is_approved": true,
-		}).Error
 }

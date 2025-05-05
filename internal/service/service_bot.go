@@ -3,12 +3,16 @@ package service
 import (
 	"Cyber-chase/internal/models"
 	"Cyber-chase/internal/repository"
+	"context"
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
 	"fmt"
 	"github.com/google/uuid"
 	"golang.org/x/crypto/bcrypt"
+	"gorm.io/gorm"
+
+	"time"
 )
 
 // MailService интерфейс для отправки почты
@@ -27,18 +31,27 @@ type TeamService interface {
 	SubmitAnswer(teamID uuid.UUID, taskID uuid.UUID, answer string) (bool, error)
 	GetUnassignedTeams() ([]models.Team, error)
 	ApproveTeam(teamID, companyID uuid.UUID) error
+	GetTaskSession(teamID, taskID uuid.UUID) (*models.TeamTaskSession, error)
+	GetTeamByID(teamID uuid.UUID) (*models.Team, error)
+	GetCompanyCredentials(companyID uuid.UUID) (*models.Company, error)
+	GetCompanyIDByTeam(teamID uuid.UUID) (uuid.UUID, error)
+	GetCompanyByID(companyID uuid.UUID) (*models.Company, error)
 }
 
 // TeamServiceImpl имплементация TeamService
 type TeamServiceImpl struct {
 	repo       repository.TeamRepository
+	coreRepo   *repository.Repository
+	db         *gorm.DB
 	mailClient MailService
 }
 
 // NewTeamService создает новый сервис для работы с командами
-func NewTeamService(repo repository.TeamRepository, mailClient MailService) *TeamServiceImpl {
+func NewTeamService(teamRepo repository.TeamRepository, coreRepo *repository.Repository, db *gorm.DB, mailClient MailService) *TeamServiceImpl {
 	return &TeamServiceImpl{
-		repo:       repo,
+		repo:       teamRepo,
+		coreRepo:   coreRepo,
+		db:         db,
 		mailClient: mailClient,
 	}
 }
@@ -152,14 +165,25 @@ func (s *TeamServiceImpl) GetTask(teamID uuid.UUID) (*models.Task, error) {
 	}
 
 	// Проверяем, что команда участвует в контесте
-	if team.ContestID == nil {
-		return nil, errors.New("team is not participating in any contest")
+	if team.ContestID == nil || team.CompanyID == nil {
+		return nil, errors.New("team is not assigned to contest or company")
 	}
 
-	// Получаем задачу для команды в этом контесте
-	task, err := s.repo.GetTaskForTeam(teamID, *team.ContestID)
+	// Получаем ID задач, которые команда уже решала
+	usedIDs, _ := s.repo.GetUsedTaskIDs(team.ID)
+
+	// Получаем новую уникальную задачу
+	var task models.Task
+	query := s.db.Where("contest_id = ? AND company_id = ?", *team.ContestID, *team.CompanyID)
+
+	if len(usedIDs) > 0 {
+		query = query.Where("id NOT IN ?", usedIDs)
+	}
+
+	err = query.First(&task).Error
+
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("нет доступных задач: %v", err)
 	}
 
 	// Обновляем текущую задачу команды
@@ -168,9 +192,20 @@ func (s *TeamServiceImpl) GetTask(teamID uuid.UUID) (*models.Task, error) {
 		return nil, err
 	}
 
-	return task, nil
+	// Создаем сессию задачи
+	session := &models.TeamTaskSession{
+		TeamID:    team.ID,
+		TaskID:    task.ID,
+		StartTime: time.Now(),
+		Attempts:  0,
+		Finished:  false,
+	}
+	_ = s.repo.CreateTaskSession(session)
+
+	return &task, nil
 }
 
+// SubmitAnswer проверяет ответ команды на задачу
 // SubmitAnswer проверяет ответ команды на задачу
 func (s *TeamServiceImpl) SubmitAnswer(teamID uuid.UUID, taskID uuid.UUID, answer string) (bool, error) {
 	team, err := s.repo.FindByID(teamID)
@@ -178,32 +213,68 @@ func (s *TeamServiceImpl) SubmitAnswer(teamID uuid.UUID, taskID uuid.UUID, answe
 		return false, errors.New("team not found")
 	}
 
-	// Проверяем, что команда работает над этой задачей
 	if team.CurrentTaskID == nil || *team.CurrentTaskID != taskID {
 		return false, errors.New("team is not working on this task")
 	}
 
-	// Получаем задачу для проверки ответа
-	var task models.Task
-	tasks, err := s.repo.GetTaskForTeam(teamID, *team.ContestID)
+	task, err := s.coreRepo.GetTaskByID(context.TODO(), taskID)
 	if err != nil {
-		return false, err
+		return false, errors.New("task not found")
 	}
-	task = *tasks
 
-	// Проверяем ответ
+	session, err := s.repo.GetTaskSession(team.ID, taskID)
+	if err != nil {
+		return false, errors.New("task session not found")
+	}
+
+	if session.Finished || session.Attempts >= 3 || time.Since(session.StartTime) > 10*time.Minute {
+		return false, errors.New("Task is finished or timed out")
+	}
+
+	session.Attempts++
 	isCorrect := task.CorrectAnswer == answer
+	session.IsCorrect = isCorrect
 
-	// Сохраняем ответ
+	// === ДОБАВЛЕНО: расчёт и накопление времени, если задача завершена ===
+	if isCorrect || session.Attempts >= 3 || time.Since(session.StartTime) > 10*time.Minute {
+		session.Finished = true
+
+		// === Вычисляем фактическое время выполнения задачи ===
+		endTime := time.Now()
+		duration := endTime.Sub(session.StartTime)
+		if duration > 10*time.Minute {
+			duration = 10 * time.Minute // Лимит
+		}
+
+		// === Обновляем очки, если ответ правильный ===
+		if isCorrect {
+			team.Points += 1
+		}
+
+		// === Правильно накапливаем время в команде ===
+		// Преобразуем текущее TotalDuration в time.Duration
+		currentDuration := team.TotalDuration.Duration()
+
+		// Добавляем новую продолжительность
+		newTotalDuration := currentDuration + duration
+
+		// Обновляем TotalDuration команды
+		team.TotalDuration = models.PGInterval(newTotalDuration)
+
+		err := s.repo.Update(team)
+		if err != nil {
+			return false, errors.New("failed to update team with duration")
+		}
+	}
+	_ = s.repo.UpdateTaskSession(session)
+
 	teamAnswer := &models.TeamAnswer{
 		TeamID:    teamID,
 		TaskID:    taskID,
 		Answer:    answer,
 		IsCorrect: isCorrect,
 	}
-	if err := s.repo.SaveAnswer(teamAnswer); err != nil {
-		return false, err
-	}
+	_ = s.repo.SaveAnswer(teamAnswer)
 
 	return isCorrect, nil
 }
@@ -222,4 +293,26 @@ func (s *TeamServiceImpl) GetUnassignedTeams() ([]models.Team, error) {
 
 func (s *TeamServiceImpl) ApproveTeam(teamID, companyID uuid.UUID) error {
 	return s.repo.ApproveTeam(teamID, companyID)
+}
+
+func (s *TeamServiceImpl) GetTaskSession(teamID, taskID uuid.UUID) (*models.TeamTaskSession, error) {
+	return s.repo.GetTaskSession(teamID, taskID)
+}
+
+func (s *TeamServiceImpl) GetTeamByID(teamID uuid.UUID) (*models.Team, error) {
+	return s.repo.FindByID(teamID)
+}
+func (s *TeamServiceImpl) GetCompanyCredentials(companyID uuid.UUID) (*models.Company, error) {
+	return s.coreRepo.GetCompanyByID(context.Background(), companyID)
+}
+func (s *TeamServiceImpl) GetCompanyIDByTeam(teamID uuid.UUID) (uuid.UUID, error) {
+	team, err := s.repo.FindByID(teamID)
+	if err != nil || team.CompanyID == nil {
+		return uuid.Nil, errors.New("team has no company")
+	}
+	return *team.CompanyID, nil
+}
+
+func (s *TeamServiceImpl) GetCompanyByID(companyID uuid.UUID) (*models.Company, error) {
+	return s.coreRepo.GetCompanyByID(context.Background(), companyID)
 }

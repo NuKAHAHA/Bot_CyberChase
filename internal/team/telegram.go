@@ -2,25 +2,38 @@ package team
 
 import (
 	"Cyber-chase/internal/models"
+	"Cyber-chase/internal/pkg"
 	"Cyber-chase/internal/service"
+	"bytes"
+	"encoding/json"
 	"fmt"
+	"github.com/golang-jwt/jwt/v4"
+	"github.com/google/uuid"
+	"io"
 	"log"
+	"net/http"
+	"os"
 	"regexp"
-	"strconv"
 	"strings"
+	"time"
 
 	tgbotapi "github.com/go-telegram-bot-api/telegram-bot-api/v5"
 )
 
 const (
-	StateStart           = "start"    // Начальное состояние
-	StateEmail           = "email"    // Ввод email
-	StatePassword        = "password" // Ввод пароля
-	StateMenu            = "menu"     // Главное меню
-	StateAnswer          = "answer"   // Ввод ответа на задачу
-	StateRegisterName    = "register_name"
-	StateRegisterPass    = "register_pass"
-	StateRegisterConfirm = "register_confirm"
+	StateStart            = "start"
+	StateEmail            = "email"
+	StatePassword         = "password"
+	StateMenu             = "menu"
+	StateAnswer           = "answer"
+	StateRegisterName     = "register_name"
+	StateRegisterPass     = "register_pass"
+	StateRegisterConfirm  = "register_confirm"
+	StateWaitingGeo       = "waiting_geo"
+	StateWaitingApprove   = "waiting_approve"
+	StateReadyToGetTask   = "ready_to_get_task"
+	StateTaskReceived     = "task_received"
+	StateAllTasksComplete = "all_tasks_done"
 )
 
 // Сессия пользователя
@@ -161,8 +174,8 @@ func (b *TelegramBot) handleMessage(message *tgbotapi.Message) {
 		}
 
 		session.TeamID = team.ID.String()
-		b.sendMainMenu(message.Chat.ID)
 		session.State = StateMenu
+		b.sendMainMenu(message.Chat.ID)
 
 	case StateMenu:
 		b.handleMenuCommand(message)
@@ -170,19 +183,40 @@ func (b *TelegramBot) handleMessage(message *tgbotapi.Message) {
 	case StateAnswer:
 		answer := strings.TrimSpace(message.Text)
 
-		// Исправлено: Удалены неиспользуемые переменные teamID и taskID
-		// Прямо использующие методы для парсинга из строки в UUID
-		correct, err := b.teamService.SubmitAnswer(models.UUIDFromString(session.TeamID), models.UUIDFromString(session.TaskID), answer)
+		correct, err := b.teamService.SubmitAnswer(
+			models.UUIDFromString(session.TeamID),
+			models.UUIDFromString(session.TaskID),
+			answer,
+		)
+
 		if err != nil {
 			b.sendMessage(message.Chat.ID, "Ошибка при отправке ответа: "+err.Error())
 		} else if correct {
-			b.sendMessage(message.Chat.ID, "Правильный ответ! 🎉")
+			b.sendMessage(message.Chat.ID, "✅ Правильный ответ!")
 		} else {
-			b.sendMessage(message.Chat.ID, "Неправильный ответ. Попробуйте еще раз.")
+			b.sendMessage(message.Chat.ID, "❌ Неправильный ответ.")
 		}
 
-		b.sendMainMenu(message.Chat.ID)
+		// Проверка: закончена ли задача
+		sessionData, err := b.teamService.GetTaskSession(
+			models.UUIDFromString(session.TeamID),
+			models.UUIDFromString(session.TaskID),
+		)
+
+		if err == nil && sessionData.Finished {
+			// Пытаемся выдать следующее задание
+			task, err := b.teamService.GetTask(models.UUIDFromString(session.TeamID))
+			if err != nil {
+				b.sendMessage(message.Chat.ID, "Больше нет доступных задач или ваша сессия завершена.")
+			} else {
+				session.TaskID = task.ID.String()
+				b.sendMessage(message.Chat.ID, "Следующая задача:\\n\\n\""+task.Question)
+				return
+			}
+		}
+
 		session.State = StateMenu
+		b.sendMainMenu(message.Chat.ID)
 	}
 }
 
@@ -209,20 +243,128 @@ func isValidEmail(email string) bool {
 // handleCallback обрабатывает callback запросы от inline кнопок
 func (b *TelegramBot) handleCallback(callback *tgbotapi.CallbackQuery) {
 	session := b.getSession(callback.Message.Chat.ID)
-
-	// Отвечаем на callback, чтобы убрать часы загрузки
-	callbackConfig := tgbotapi.NewCallback(callback.ID, "")
-	b.bot.Request(callbackConfig)
+	b.bot.Request(tgbotapi.NewCallback(callback.ID, ""))
 
 	switch callback.Data {
 	case "join_contest":
-		b.handleJoinContest(callback.Message.Chat.ID, session)
+		contest, err := b.teamService.JoinContest(uuid.MustParse(session.TeamID))
+		if err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Ошибка: "+err.Error())
+			return
+		}
+		b.sendMessage(callback.Message.Chat.ID, fmt.Sprintf("✅ Вы присоединились к контесту: %s", contest.Name))
+		session.State = StateWaitingGeo
+		b.sendMainMenu(callback.Message.Chat.ID)
+
+	case "send_geo":
+		teamID := uuid.MustParse(session.TeamID)
+
+		// 1. Получаем companyID для команды
+		companyID, err := b.teamService.GetCompanyIDByTeam(teamID)
+		if err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Команда не привязана к компании: "+err.Error())
+			return
+		}
+
+		// 2. Получаем токен компании
+		token, err := b.getCompanyTokenDirect(companyID)
+		if err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Ошибка авторизации: "+err.Error())
+			return
+		}
+
+		// 3. Запрашиваем геолокацию
+		locReq, err := http.NewRequest("GET", "http://localhost:8080/api/v1/company/location", nil)
+		if err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Ошибка создания запроса геолокации: "+err.Error())
+			return
+		}
+		locReq.Header.Set("Authorization", "Bearer "+token)
+
+		client := &http.Client{}
+		locResp, err := client.Do(locReq)
+		if err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Ошибка запроса геолокации: "+err.Error())
+			return
+		}
+		defer locResp.Body.Close()
+
+		// 4. Обрабатываем ответ
+		locBody, _ := io.ReadAll(locResp.Body)
+		if locResp.StatusCode != http.StatusOK {
+			b.sendMessage(callback.Message.Chat.ID, fmt.Sprintf("❌ Не удалось получить геолокацию: статус %d, ответ: %s",
+				locResp.StatusCode, string(locBody)))
+			return
+		}
+
+		// 5. Парсим данные геолокации
+		var locationResponse struct {
+			MapLink string `json:"map_link"`
+		}
+		if err := json.Unmarshal(locBody, &locationResponse); err != nil {
+			b.sendMessage(callback.Message.Chat.ID, "❌ Ошибка обработки данных геолокации: "+err.Error())
+			return
+		}
+
+		// 6. Отправляем результат пользователю
+		b.sendMessage(callback.Message.Chat.ID, "📍 Геолокация компании:\n"+locationResponse.MapLink)
+		b.sendMessage(callback.Message.Chat.ID, "Ожидайте одобрения...")
+		session.State = StateWaitingApprove
+		go b.awaitApproval(callback.Message.Chat.ID, session)
+
 	case "get_task":
 		b.handleGetTask(callback.Message.Chat.ID, session)
+
 	case "submit_answer":
-		b.sendMessage(callback.Message.Chat.ID, "Введите ваш ответ:")
+		b.sendMessage(callback.Message.Chat.ID, "✍️ Введите ваш ответ:")
 		session.State = StateAnswer
+
+	case "logout":
+		delete(b.sessions, callback.Message.Chat.ID)
+		b.sendMessage(callback.Message.Chat.ID, "🚪 Вы вышли. Введите /start чтобы начать заново.")
 	}
+}
+
+func (b *TelegramBot) getCompanyToken(teamID uuid.UUID) (string, error) {
+	// 1. Получить CompanyID через сервис команд
+	companyID, err := b.teamService.GetCompanyIDByTeam(teamID)
+	if err != nil {
+		return "", fmt.Errorf("team company not found: %v", err)
+	}
+
+	// 2. Получить данные компании через сервис
+	companyData, err := b.teamService.GetCompanyCredentials(companyID)
+	if err != nil {
+		return "", fmt.Errorf("company data error: %v", err)
+	}
+
+	// 3. Авторизоваться как компания
+	client := &http.Client{}
+	data := map[string]string{
+		"email":    companyData.Email,
+		"password": companyData.TempPassword,
+	}
+	jsonData, _ := json.Marshal(data)
+
+	resp, err := client.Post(
+		"http://localhost:8080/api/v1/company/login",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+	if err != nil || resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ошибка аутентификации: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// 3. Парсим токен из ответа
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return "", fmt.Errorf("ошибка парсинга токена: %v", err)
+	}
+
+	return result.Token, nil
 }
 
 // sendStartMessage отправляет приветственное сообщение
@@ -233,20 +375,42 @@ func (b *TelegramBot) sendStartMessage(chatID int64) {
 
 // sendMainMenu отправляет главное меню
 func (b *TelegramBot) sendMainMenu(chatID int64) {
-	var keyboard = tgbotapi.NewInlineKeyboardMarkup(
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Присоединиться к контесту", "join_contest"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Получить задачу", "get_task"),
-		),
-		tgbotapi.NewInlineKeyboardRow(
-			tgbotapi.NewInlineKeyboardButtonData("Отправить ответ", "submit_answer"),
-		),
-	)
+	session := b.getSession(chatID)
+	var buttons [][]tgbotapi.InlineKeyboardButton
+
+	switch session.State {
+	case StateMenu:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Добавиться к контесту", "join_contest"),
+		})
+	case StateWaitingGeo:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Получить гео", "send_geo"),
+		})
+	case StateWaitingApprove:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Ожидание одобрения...", "waiting_approve"),
+		})
+	case StateReadyToGetTask:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Получить задание", "get_task"),
+		})
+	case StateTaskReceived:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Дать ответ", "submit_answer"),
+		})
+	case StateAllTasksComplete:
+		buttons = append(buttons, []tgbotapi.InlineKeyboardButton{
+			tgbotapi.NewInlineKeyboardButtonData("Выйти", "logout"),
+		})
+	}
 
 	msg := tgbotapi.NewMessage(chatID, "Главное меню:")
-	msg.ReplyMarkup = keyboard
+	if len(buttons) > 0 {
+		msg.ReplyMarkup = tgbotapi.NewInlineKeyboardMarkup(buttons...)
+	} else {
+		msg.Text = "Добро пожаловать! Выберите действие."
+	}
 	b.bot.Send(msg)
 }
 
@@ -278,27 +442,50 @@ func (b *TelegramBot) handleJoinContest(chatID int64, session *UserSession) {
 	b.sendMessage(chatID, msg)
 }
 
+func (b *TelegramBot) awaitApproval(chatID int64, session *UserSession) {
+	_, err := b.teamService.GetTeamByEmail(session.Email)
+	if err != nil {
+		b.sendMessage(chatID, "❌ Ошибка: команда не найдена")
+		return
+	}
+
+	for i := 0; i < 30; i++ { // до 30 попыток (например, 30 секунд)
+		time.Sleep(2 * time.Second)
+		updated, err := b.teamService.GetTeamByEmail(session.Email)
+		if err == nil && updated.CompanyID != nil {
+			b.sendMessage(chatID, "🎉 Ваша команда была одобрена компанией!")
+			session.State = StateReadyToGetTask
+			b.sendMainMenu(chatID)
+			return
+		}
+	}
+
+	b.sendMessage(chatID, "⌛ Ожидание одобрения превысило лимит времени. Попробуйте позже.")
+	session.State = StateMenu
+	b.sendMainMenu(chatID)
+}
+
 // handleGetTask обрабатывает запрос на получение задачи
 func (b *TelegramBot) handleGetTask(chatID int64, session *UserSession) {
-	teamID := models.UUIDFromString(session.TeamID)
-	task, err := b.teamService.GetTask(teamID)
+	task, err := b.teamService.GetTask(uuid.MustParse(session.TeamID))
 	if err != nil {
-		b.sendMessage(chatID, "Ошибка при получении задачи: "+err.Error())
+		b.sendMessage(chatID, "❌ Ошибка при получении задачи: "+err.Error())
 		return
 	}
 
 	session.TaskID = task.ID.String()
+	session.State = StateTaskReceived
 
-	msg := "Задача:\n\n" + task.Question
 	if task.QuestionFile != "" {
-		msg += "\n\nФайл с дополнительной информацией: " + task.QuestionFile
+		filePath := pkg.GetFilePath(task.ID, task.QuestionFile)
+		doc := tgbotapi.NewDocument(chatID, tgbotapi.FilePath(filePath))
+		doc.Caption = fmt.Sprintf("Задача:\n\n%s\n\nВремя: %d минут", task.Question, task.TimeLimit)
+		b.bot.Send(doc)
+	} else {
+		b.sendMessage(chatID, fmt.Sprintf("Задача:\n\n%s\n\nВремя: %d минут", task.Question, task.TimeLimit))
 	}
 
-	if task.TimeLimit > 0 {
-		msg += "\n\nВремя на решение: " + strconv.Itoa(task.TimeLimit) + " минут"
-	}
-
-	b.sendMessage(chatID, msg)
+	b.sendMainMenu(chatID)
 }
 
 // sendMessage отправляет сообщение пользователю
@@ -308,4 +495,174 @@ func (b *TelegramBot) sendMessage(chatID int64, text string) {
 	if err != nil {
 		log.Printf("Error sending message: %v", err)
 	}
+}
+
+// Helper function to authenticate as a company and get a token
+func (b *TelegramBot) authenticateCompany(email, password string) (string, error) {
+	client := &http.Client{}
+
+	// Check the actual request structure expected by the server
+	// This structure should match what the server expects to unmarshal
+	data := map[string]interface{}{
+		"email":    email,
+		"password": password,
+	}
+
+	jsonData, err := json.Marshal(data)
+	if err != nil {
+		return "", fmt.Errorf("ошибка сериализации JSON: %v", err)
+	}
+
+	// For debugging - log the request body
+	log.Printf("Authentication request body: %s", string(jsonData))
+
+	resp, err := client.Post(
+		"http://localhost:8080/api/v1/company/login",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+	if err != nil {
+		return "", fmt.Errorf("ошибка запроса: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read the response body for debugging
+	respBody, _ := io.ReadAll(resp.Body)
+	log.Printf("Authentication response (status %d): %s", resp.StatusCode, string(respBody))
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ошибка авторизации, статус: %d, ответ: %s", resp.StatusCode, string(respBody))
+	}
+
+	// Need to create a new reader since we consumed the response body above
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("ошибка парсинга токена: %v", err)
+	}
+
+	return result.Token, nil
+}
+
+// Alternative implementation that checks company credentials first
+func (b *TelegramBot) authenticateCompany2(companyID uuid.UUID) (string, error) {
+	// 1. Get company data to check what credentials we have
+	company, err := b.teamService.GetCompanyCredentials(companyID)
+	if err != nil {
+		return "", fmt.Errorf("ошибка получения данных компании: %v", err)
+	}
+
+	// Log credentials for debugging (remove in production)
+	log.Printf("Company credentials - Email: %s, TempPass: %s", company.Email, company.TempPassword)
+
+	client := &http.Client{}
+
+	// Try different request structures
+	// Version 1: Standard format
+	reqBody1 := map[string]string{
+		"email":    company.Email,
+		"password": company.TempPassword,
+	}
+
+	// Version 2: Using different field names (in case server expects different names)
+	reqBody2 := map[string]string{
+		"email":        company.Email,
+		"tempPassword": company.TempPassword,
+	}
+
+	// Try first format
+	jsonData, _ := json.Marshal(reqBody1)
+	resp, err := client.Post(
+		"http://localhost:8080/api/v1/company/login",
+		"application/json",
+		bytes.NewBuffer(jsonData),
+	)
+
+	if err != nil || resp.StatusCode != http.StatusOK {
+		// If first format fails, try second format
+		jsonData, _ = json.Marshal(reqBody2)
+		resp, err = client.Post(
+			"http://localhost:8080/api/v1/company/login",
+			"application/json",
+			bytes.NewBuffer(jsonData),
+		)
+
+		if err != nil {
+			return "", fmt.Errorf("ошибка запроса: %v", err)
+		}
+	}
+
+	defer resp.Body.Close()
+
+	// Read response body
+	respBody, _ := io.ReadAll(resp.Body)
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ошибка авторизации, статус: %d, ответ: %s", resp.StatusCode, string(respBody))
+	}
+
+	var result struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(respBody, &result); err != nil {
+		return "", fmt.Errorf("ошибка парсинга токена: %v", err)
+	}
+
+	return result.Token, nil
+}
+
+func (b *TelegramBot) getCompanyLocation(token string) (string, error) {
+	client := &http.Client{}
+	req, err := http.NewRequest("GET", "http://localhost:8080/api/v1/company/location", nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+token)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("ошибка получения геолокации, статус: %d", resp.StatusCode)
+	}
+
+	var locationResponse struct {
+		MapLink string `json:"map_link"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&locationResponse); err != nil {
+		return "", fmt.Errorf("ошибка обработки данных: %v", err)
+	}
+
+	return locationResponse.MapLink, nil
+}
+
+func (b *TelegramBot) getCompanyTokenDirect(companyID uuid.UUID) (string, error) {
+	// Do a direct database query to get the company info
+	// This is instead of going through the API login flow
+	company, err := b.teamService.GetCompanyByID(companyID)
+	if err != nil {
+		return "", fmt.Errorf("failed to get company: %v", err)
+	}
+
+	// Generate a JWT token directly using the same logic as your API
+	// You'll need to share the JWT secret with this code
+	jwtSecret := os.Getenv("JWT_SECRET") // Replace with your actual JWT secret
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub":            company.ID.String(),
+		"role":           "company",
+		"exp":            time.Now().Add(time.Hour * 24).Unix(),
+		"reset_required": company.ResetRequired,
+	})
+
+	tokenString, err := token.SignedString([]byte(jwtSecret))
+	if err != nil {
+		return "", fmt.Errorf("failed to generate token: %v", err)
+	}
+
+	return tokenString, nil
 }

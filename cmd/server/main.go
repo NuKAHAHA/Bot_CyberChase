@@ -15,7 +15,6 @@ import (
 	"gorm.io/gorm"
 	"log"
 	"os"
-	"time"
 )
 
 func main() {
@@ -29,7 +28,7 @@ func main() {
 		panic("Error loading .env file")
 	}
 
-	db.AutoMigrate(&models.Contest{}, &models.Company{}, &models.Task{}, &models.Team{})
+	db.AutoMigrate(&models.Contest{}, &models.Company{}, &models.Task{}, &models.Team{}, &models.TeamAnswer{}, &models.TeamTaskSession{})
 
 	repo := repository.NewRepository(db)
 	adminHandler := admin.NewAdminHandler(repo, "admin", "0000")
@@ -43,21 +42,14 @@ func main() {
 
 	companyTaskHandler := company.NewCompanyTaskHandler(repo)
 	teamRepo := repository.NewTeamRepository(db)
-	teamService := service.NewTeamService(teamRepo, mailService)
+	teamService := service.NewTeamService(teamRepo, repo, db, mailService)
 	companyHandler := company.NewCompanyHandler(repo, mailService, teamService)
 	teamHandler := team.NewTeamHandler(teamService)
 	jwtSecret := os.Getenv("JWT_SECRET")
 
 	router := gin.Default()
 
-	router.Use(cors.New(cors.Config{
-		AllowOrigins:     []string{"http://localhost:4200"},
-		AllowMethods:     []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowHeaders:     []string{"Origin", "Content-Type", "Authorization"},
-		ExposeHeaders:    []string{"Content-Length"},
-		AllowCredentials: true,
-		MaxAge:           12 * time.Hour,
-	}))
+	router.Use(cors.Default())
 
 	botToken := os.Getenv("BOT_TOKEN")
 	if botToken == "" {

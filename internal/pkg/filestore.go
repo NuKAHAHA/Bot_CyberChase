@@ -13,7 +13,6 @@ import (
 const UploadDir = "./uploads"
 
 func init() {
-	// Ensure upload directory exists
 	if err := os.MkdirAll(UploadDir, 0755); err != nil {
 		panic(fmt.Sprintf("Failed to create upload directory: %v", err))
 	}
@@ -21,7 +20,6 @@ func init() {
 
 // SaveFile saves an uploaded file to disk and returns the path
 func SaveFile(file *multipart.FileHeader, taskID uuid.UUID) (string, error) {
-	// Create task directory if it doesn't exist
 	taskDir := filepath.Join(UploadDir, taskID.String())
 	if err := os.MkdirAll(taskDir, 0755); err != nil {
 		return "", fmt.Errorf("failed to create task directory: %w", err)

@@ -25,7 +25,6 @@ type Company struct {
 	Location      string
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
-	CurrentTeamID *uuid.UUID `gorm:"type:uuid"`
 }
 
 type Task struct {
@@ -48,7 +47,8 @@ type Team struct {
 	ContestID     *uuid.UUID `gorm:"type:uuid"`
 	CurrentTaskID *uuid.UUID `gorm:"type:uuid"`
 	CompanyID     *uuid.UUID `gorm:"type:uuid"`
-	isApproved    bool       `gorm:"default:false"`
+	Points        int        `gorm:"default:0"`
+	TotalDuration PGInterval `gorm:"type:interval"`
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
 }
@@ -69,4 +69,15 @@ func UUIDFromString(s string) uuid.UUID {
 		return uuid.Nil
 	}
 	return id
+}
+
+type TeamTaskSession struct {
+	ID        uuid.UUID `gorm:"type:uuid;primary_key;default:uuid_generate_v4()"`
+	TeamID    uuid.UUID `gorm:"not null"`
+	TaskID    uuid.UUID `gorm:"not null"`
+	StartTime time.Time
+	Attempts  int  `gorm:"default:0"`
+	Finished  bool `gorm:"default:false"`
+	IsCorrect bool `gorm:"default:false"`
+	CreatedAt time.Time
 }

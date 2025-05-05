@@ -22,6 +22,10 @@ type TeamRepository interface {
 	GetTaskForTeam(teamID uuid.UUID, contestID uuid.UUID) (*models.Task, error)
 	GetUnassignedTeams() ([]models.Team, error)
 	ApproveTeam(teamID, companyID uuid.UUID) error
+	CreateTaskSession(session *models.TeamTaskSession) error
+	GetTaskSession(teamID, taskID uuid.UUID) (*models.TeamTaskSession, error)
+	UpdateTaskSession(session *models.TeamTaskSession) error
+	GetUsedTaskIDs(teamID uuid.UUID) ([]uuid.UUID, error)
 }
 
 // GormTeamRepository имплементация TeamRepository с использованием GORM
@@ -135,4 +139,31 @@ func (r *GormTeamRepository) ApproveTeam(teamID, companyID uuid.UUID) error {
 	return r.db.Model(&models.Team{}).
 		Where("id = ?", teamID).
 		Update("company_id", companyID).Error
+}
+
+func (r *GormTeamRepository) CreateTaskSession(session *models.TeamTaskSession) error {
+	return r.db.Create(session).Error
+}
+
+func (r *GormTeamRepository) GetTaskSession(teamID, taskID uuid.UUID) (*models.TeamTaskSession, error) {
+	var session models.TeamTaskSession
+	err := r.db.Where("team_id = ? AND task_id = ?", teamID, taskID).
+		Order("created_at desc").
+		First(&session).Error
+	if err != nil {
+		return nil, err
+	}
+	return &session, nil
+}
+
+func (r *GormTeamRepository) UpdateTaskSession(session *models.TeamTaskSession) error {
+	return r.db.Save(session).Error
+}
+
+func (r *GormTeamRepository) GetUsedTaskIDs(teamID uuid.UUID) ([]uuid.UUID, error) {
+	var ids []uuid.UUID
+	err := r.db.Model(&models.TeamTaskSession{}).
+		Where("team_id = ?", teamID).
+		Pluck("task_id", &ids).Error
+	return ids, err
 }

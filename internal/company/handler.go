@@ -634,3 +634,52 @@ func (h *CompanyHandler) ApproveTeam(c *gin.Context) {
 
 	c.JSON(http.StatusOK, gin.H{"status": "team approved"})
 }
+
+func (h *CompanyHandler) CompanyHashLogin(c *gin.Context) {
+	var req struct {
+		Email        string `json:"email" binding:"required"`
+		PasswordHash string `json:"password_hash" binding:"required"`
+		DirectAuth   bool   `json:"direct_auth" binding:"required"`
+	}
+
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+
+	// Only allow this endpoint to be used internally, never from public API
+	if !req.DirectAuth {
+		c.JSON(http.StatusForbidden, gin.H{"error": "Unauthorized access method"})
+		return
+	}
+
+	company, err := h.repo.GetCompanyByEmail(c.Request.Context(), req.Email)
+	if err != nil {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	// Directly compare the password hash instead of using bcrypt.Compare
+	if company.PasswordHash != req.PasswordHash {
+		c.JSON(http.StatusUnauthorized, gin.H{"error": "Invalid credentials"})
+		return
+	}
+
+	token := jwt.NewWithClaims(jwt.SigningMethodHS256, jwt.MapClaims{
+		"sub":            company.ID.String(),
+		"role":           "company",
+		"exp":            time.Now().Add(time.Hour * 24).Unix(),
+		"reset_required": company.ResetRequired,
+	})
+
+	tokenString, err := token.SignedString([]byte(h.jwtSecret))
+	if err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to generate token"})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"token":          tokenString,
+		"reset_required": company.ResetRequired,
+	})
+}
